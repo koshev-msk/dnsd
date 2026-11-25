@@ -320,6 +320,48 @@ static int bootstrap_query(const struct sockaddr* srv, socklen_t srvlen, const c
     return EXIT_FAILURE;
 }
 
+// "ip", "ip:port", "ip#port" (dnsmasq style) or "[ipv6]:port" -> host and port, the port defaults to 53
+static int split_server(char* tok, const char** host, const char** port)
+{
+    char* sep = NULL;
+
+    *host = tok;
+    *port = "53";
+
+    if (tok[0] == '[')
+    {
+        char* end = strchr(tok, ']');
+
+        if (end == NULL) return EXIT_FAILURE;
+
+        *host = tok + 1;
+        *end  = '\0';
+
+        if (end[1] == ':') sep = end + 1;
+        else if (end[1] != '\0') return EXIT_FAILURE;
+    }
+    else if ((sep = strchr(tok, '#')) == NULL)
+    {
+        // a single colon is ip:port, more of them is a bare IPv6 address
+        sep = strchr(tok, ':');
+        if (sep && strchr(sep + 1, ':')) sep = NULL;
+    }
+
+    if (sep)
+    {
+        char* end = NULL;
+        long  val;
+
+        *sep  = '\0';
+        *port = sep + 1;
+        val   = strtol(*port, &end, 10);
+
+        if (**port == '\0' || *end != '\0' || val < 1 || val > 65535) return EXIT_FAILURE;
+    }
+
+    return **host ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 // resolve the host of the URL through the bootstrap server(s) and give the address to curl
 static int bootstrap_apply()
 {
@@ -337,13 +379,19 @@ static int bootstrap_apply()
     for (tok = strtok(list, ","); tok && !found; tok = strtok(NULL, ","))
     {
         struct addrinfo hints, *ai = NULL;
+        char        one[64];
+        const char* host;
+        const char* port;
 
         memset(&hints, 0x00, sizeof(hints));
         hints.ai_family     = AF_UNSPEC;
         hints.ai_socktype   = SOCK_DGRAM;
         hints.ai_flags      = AI_NUMERICHOST | AI_NUMERICSERV;
 
-        if (getaddrinfo(tok, "53", &hints, &ai) != 0)
+        strncpy(one, tok, sizeof(one) - 1);
+        one[sizeof(one) - 1] = '\0';
+
+        if (split_server(one, &host, &port) != EXIT_SUCCESS || getaddrinfo(host, port, &hints, &ai) != 0)
         {
             LOG_ERROR("invalid bootstrap address (%s)", tok);
             continue;
@@ -751,7 +799,8 @@ void usage(char* exec_name)
     fprintf(stderr, "Usage : %s --url URL [options]\n\n", exec_name);
     fprintf(stderr,
         "  -u, --url URL          DoH endpoint (RFC 8484), e.g. https://1.1.1.1/dns-query\n"
-        "  -b, --bootstrap IP,..  DNS server(s) used only to resolve the host name of the URL\n"
+        "  -b, --bootstrap SRV,.. DNS server(s) used only to resolve the host name of the URL,\n"
+        "                         each IP, IP:PORT, IP#PORT or [IPv6]:PORT (default port 53)\n"
         "  -l, --listen IP        address to listen on (default 127.0.0.1)\n"
         "  -p, --port PORT        UDP port to listen on (default 53)\n"
         "  -P, --pid FILE         write the PID file\n"

@@ -62,11 +62,11 @@
 #define OPT_HTTPS_PROXY         "https_proxy"
 #define OPT_HTTPS_PROXY_LEN     64
 #define OPT_SERVER_URL          "server_url"
-#define OPT_SERVER_URL_LEN      64
+#define OPT_SERVER_URL_LEN      256
 #define OPT_SERVER_IP           "server_ip_list"
 #define OPT_SERVER_IP_LEN       512
 #define OPT_ENABLE_EDNS         "enable_edns_ecs"
-#define OPT_DEFAULT_URL         "https://dns.google.com"
+#define OPT_DEFAULT_URL         "https://1.1.1.1/dns-query"
 #define OPT_SERVICE_PORT        "service_port"
 #define OPT_SERVICE_IP          "service_ip"
 #define OPT_SERVICE_PUB_KEY     "service_pub_key"
@@ -80,7 +80,7 @@
 #define LOG_LEVEL               LEV_NO_DEV_LOG
 #define DEBUG_ENABLE            0
 #define DEBUG_AUDIT_ENABLE      0
-#define BUFFER_SIZE             102400
+#define BUFFER_SIZE             65535
 #define DNS_MAX_SIZE            512
 #define EDNS_MAX_SIZE           4096
 #define DNS_SERVER_PORT         53
@@ -175,14 +175,6 @@ struct dns_soa
 /*      functions         */
 
 
-size_t  json_to_answer(char*, struct dns_header_detail*, size_t);
-
-void    format(char*, size_t);
-
-void    copy(char* const, const char*, size_t);
-
-char*   getTypeString(uint16_t, int);
-
 void    handle_signal(int);
 
 void    usage(char*);
@@ -192,8 +184,6 @@ int     parse_options();
 int     create_pidfile();
 
 int     remove_spaces(char*);
-
-void    hexdump(char*, void*, int);
 
 #endif /* DNSSL_H */
 

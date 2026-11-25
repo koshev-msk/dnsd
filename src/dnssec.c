@@ -32,13 +32,14 @@
 #include <poll.h>
 #include <sys/stat.h>   // umask()
 #include <errno.h>
+#include <time.h>
 #include <dnssec.h>
 #include <log.h>
 
 
 sig_atomic_t                        running = 0;
 static int                          sock;
-static int                          pidfp;
+static int                          pidfp = -1;
 static unsigned char*               buffer;
 static struct sockaddr_storage      peer_add;
 static socklen_t                    peer_add_len;
@@ -148,7 +149,13 @@ struct dns_resp
 
 static CURL*                        curl;
 static struct curl_slist*           headers;
+static struct curl_slist*           resolve;
 static struct dns_resp              resp;
+
+static char                         url_host[256];
+static char                         url_port[8];
+static int                          url_is_ip;
+static time_t                       bootstrap_time;
 
 size_t body_callback (void* contents, size_t size, size_t nmemb, void* userp)
 {
@@ -164,6 +171,211 @@ size_t body_callback (void* contents, size_t size, size_t nmemb, void* userp)
     return chunk;
 }
 
+// offset after the (possibly compressed) name at i, 0 on error
+static size_t skip_name(const unsigned char* p, size_t length, size_t i)
+{
+    while (i < length)
+    {
+        if (p[i] == 0) return i + 1;
+        if ((p[i] & 0xC0) == 0xC0) return i + 2 <= length ? i + 2 : 0;
+        if (p[i] & 0xC0) return 0;
+        i += p[i] + 1;
+    }
+
+    return 0;
+}
+
+// offset of the first byte after the question section, 0 if malformed
+static size_t question_end(const unsigned char* p, size_t length)
+{
+    size_t i = skip_name(p, length, sizeof(struct dns_header));
+
+    if (i == 0) return 0;
+    i += 4;
+
+    return i <= length ? i : 0;
+}
+
+// split the URL: host and port are needed for the bootstrap lookup
+static int url_parse()
+{
+    CURLU* u        = curl_url();
+    char*  scheme   = NULL;
+    char*  host     = NULL;
+    char*  port     = NULL;
+    int    ret      = EXIT_FAILURE;
+    struct in_addr a4;
+
+    if (u == NULL) return ret;
+
+    if (curl_url_set(u, CURLUPART_URL, options.url, 0) == CURLUE_OK &&
+        curl_url_get(u, CURLUPART_SCHEME, &scheme, 0) == CURLUE_OK &&
+        curl_url_get(u, CURLUPART_HOST, &host, 0) == CURLUE_OK &&
+        curl_url_get(u, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) == CURLUE_OK &&
+        (!strcmp(scheme, "https") || !strcmp(scheme, "http")) &&
+        strlen(host) < sizeof(url_host) && strlen(port) < sizeof(url_port))
+    {
+        strcpy(url_host, host);
+        strcpy(url_port, port);
+        url_is_ip = host[0] == '[' || inet_pton(AF_INET, host, &a4) == 1;
+        ret = EXIT_SUCCESS;
+    }
+
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_url_cleanup(u);
+
+    return ret;
+}
+
+// ask one DNS server for an A or AAAA record of host
+static int bootstrap_query(const struct sockaddr* srv, socklen_t srvlen, const char* host,
+                           uint16_t qtype, char* out, size_t outlen)
+{
+    unsigned char q[300], r[1500];
+    size_t        n = sizeof(struct dns_header);
+    const char*   p = host;
+    uint16_t      id = (uint16_t) rand();
+
+    memset(q, 0x00, n);
+    q[0] = id >> 8;
+    q[1] = id & 0xFF;
+    q[2] = 0x01;                // RD
+    q[5] = 1;                   // one question
+
+    while (*p)
+    {
+        const char* dot = strchr(p, '.');
+        size_t      l   = dot ? (size_t)(dot - p) : strlen(p);
+
+        if (l == 0 || l > MAX_SUBDOMAIN_LENGTH || n + l + 1 + 5 > sizeof(q)) return EXIT_FAILURE;
+
+        q[n++] = l;
+        memcpy(q + n, p, l);
+        n += l;
+        p += l;
+        if (*p == '.') p++;
+    }
+
+    q[n++] = 0;
+    q[n++] = qtype >> 8;
+    q[n++] = qtype & 0xFF;
+    q[n++] = 0;
+    q[n++] = DNS_INET_ADDR;     // class IN
+
+    int s = socket(srv->sa_family, SOCK_DGRAM, 0);
+    if (s < 0) return EXIT_FAILURE;
+
+    struct timeval tv = { BOOTSTRAP_TIMEOUT, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // connected socket: only the bootstrap server can answer
+    if (connect(s, srv, srvlen) != 0 || send(s, q, n, 0) != (ssize_t) n)
+    {
+        close(s);
+        return EXIT_FAILURE;
+    }
+
+    ssize_t rn = recv(s, r, sizeof(r), 0);
+    close(s);
+
+    if (rn < (ssize_t) sizeof(struct dns_header) || r[0] != q[0] || r[1] != q[1] ||
+        !(r[2] & 0x80) || (r[3] & 0x0F)) return EXIT_FAILURE;
+
+    size_t qd = (r[4] << 8) | r[5];
+    size_t an = (r[6] << 8) | r[7];
+    size_t i  = sizeof(struct dns_header);
+
+    for (size_t k = 0; k < qd; k++)
+    {
+        i = skip_name(r, rn, i);
+        if (i == 0) return EXIT_FAILURE;
+        i += 4;
+    }
+
+    for (size_t k = 0; k < an; k++)
+    {
+        i = skip_name(r, rn, i);
+        if (i == 0 || i + 10 > (size_t) rn) return EXIT_FAILURE;
+
+        uint16_t type  = (r[i] << 8) | r[i + 1];
+        uint16_t class = (r[i + 2] << 8) | r[i + 3];
+        size_t   rdlen = (r[i + 8] << 8) | r[i + 9];
+        i += 10;
+
+        if (i + rdlen > (size_t) rn) return EXIT_FAILURE;
+
+        if (class == DNS_INET_ADDR && type == qtype)
+        {
+            if (qtype == DNS_A_RECORD && rdlen == 4)
+                return inet_ntop(AF_INET, r + i, out, outlen) ? EXIT_SUCCESS : EXIT_FAILURE;
+            if (qtype == DNS_AAAA_RECORD && rdlen == 16)
+                return inet_ntop(AF_INET6, r + i, out, outlen) ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+
+        i += rdlen;
+    }
+
+    return EXIT_FAILURE;
+}
+
+// resolve the host of the URL through the bootstrap server(s) and give the address to curl
+static int bootstrap_apply()
+{
+    char  list[256];
+    char  addr[INET6_ADDRSTRLEN];
+    char  entry[sizeof(url_host) + sizeof(url_port) + INET6_ADDRSTRLEN + 8];
+    char* tok;
+    int   found = 0;
+
+    bootstrap_time = time(NULL);
+
+    strncpy(list, options.bootstrap, sizeof(list) - 1);
+    list[sizeof(list) - 1] = '\0';
+
+    for (tok = strtok(list, ","); tok && !found; tok = strtok(NULL, ","))
+    {
+        struct addrinfo hints, *ai = NULL;
+
+        memset(&hints, 0x00, sizeof(hints));
+        hints.ai_family     = AF_UNSPEC;
+        hints.ai_socktype   = SOCK_DGRAM;
+        hints.ai_flags      = AI_NUMERICHOST | AI_NUMERICSERV;
+
+        if (getaddrinfo(tok, "53", &hints, &ai) != 0)
+        {
+            LOG_ERROR("invalid bootstrap address (%s)", tok);
+            continue;
+        }
+
+        // IPv4 first: a router without IPv6 uplink cannot use an AAAA answer
+        found = bootstrap_query(ai->ai_addr, ai->ai_addrlen, url_host, DNS_A_RECORD, addr, sizeof(addr)) == EXIT_SUCCESS ||
+                bootstrap_query(ai->ai_addr, ai->ai_addrlen, url_host, DNS_AAAA_RECORD, addr, sizeof(addr)) == EXIT_SUCCESS;
+        freeaddrinfo(ai);
+
+        if (!found) LOG_ERROR("bootstrap server %s did not resolve %s", tok, url_host);
+    }
+
+    if (!found) return EXIT_FAILURE;
+
+    if (strchr(addr, ':'))
+        snprintf(entry, sizeof(entry), "%s:%s:[%s]", url_host, url_port, addr);
+    else
+        snprintf(entry, sizeof(entry), "%s:%s:%s", url_host, url_port, addr);
+
+    struct curl_slist* fresh = curl_slist_append(NULL, entry);
+    if (fresh == NULL) return EXIT_FAILURE;
+
+    if (curl) curl_easy_setopt(curl, CURLOPT_RESOLVE, fresh);
+    curl_slist_free_all(resolve);
+    resolve = fresh;
+
+    if (options.debug) LOG_INFO("bootstrap: %s -> %s", url_host, addr);
+
+    return EXIT_SUCCESS;
+}
+
 static int curl_setup()
 {
     curl = curl_easy_init();
@@ -176,7 +388,7 @@ static int curl_setup()
     headers = curl_slist_append(headers, "Content-Type: application/dns-message");
     headers = curl_slist_append(headers, "Accept: application/dns-message");
 
-    curl_easy_setopt(curl, CURLOPT_URL, options.server_url);
+    curl_easy_setopt(curl, CURLOPT_URL, options.url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
@@ -186,14 +398,19 @@ static int curl_setup()
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&resp);
 
-    if (options.https_proxy[0])
+    if (resolve)
     {
-        curl_easy_setopt(curl, CURLOPT_PROXY, options.https_proxy);
+        curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve);
     }
 
-    if (options.service_pub_key[0])
+    if (options.proxy)
     {
-        if (curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, options.service_pub_key) != CURLE_OK)
+        curl_easy_setopt(curl, CURLOPT_PROXY, options.proxy);
+    }
+
+    if (options.pin)
+    {
+        if (curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, options.pin) != CURLE_OK)
         {
             LOG_ERROR("failed to load the pinned public key");
             return EXIT_FAILURE;
@@ -201,6 +418,43 @@ static int curl_setup()
     }
 
     return EXIT_SUCCESS;
+}
+
+// one line per query: what was asked, which server answered, how
+static void log_transfer(const unsigned char* query, size_t length, CURLcode res)
+{
+    char     name[MAX_DOMAIN_LENGTH + 1] = {0};
+    char*    ip      = NULL;
+    long     port    = 0;
+    long     code    = 0;
+    long     ver     = 0;
+    double   sec     = 0;
+    uint16_t qtype   = 0;
+    size_t   i       = sizeof(struct dns_header);
+    size_t   n       = 0;
+
+    while (i < length && query[i] && !(query[i] & 0xC0) &&
+           i + query[i] < length && n + query[i] + 1 < sizeof(name))
+    {
+        memcpy(name + n, query + i + 1, query[i]);
+        n += query[i];
+        name[n++] = '.';
+        i += query[i] + 1;
+    }
+
+    if (n == 0) name[0] = '.';
+    if (i + 2 < length) qtype = (query[i + 1] << 8) | query[i + 2];
+
+    curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &ip);
+    curl_easy_getinfo(curl, CURLINFO_PRIMARY_PORT, &port);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &ver);
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &sec);
+
+    LOG_INFO("%s type %u -> %s:%ld %s %ld, %zu bytes, %.0f ms%s", name, qtype,
+             (ip && ip[0]) ? ip : "-", port,
+             ver == CURL_HTTP_VERSION_2_0 ? "HTTP/2" : ver == CURL_HTTP_VERSION_1_1 ? "HTTP/1.1" : "HTTP/?",
+             code, resp.len, sec * 1000, res == CURLE_OK ? "" : " (failed)");
 }
 
 // RFC 8484: the DNS message goes to the server as is, the answer comes back as is
@@ -213,9 +467,16 @@ static int https_query(const unsigned char* query, size_t length)
 
     CURLcode res = curl_easy_perform(curl);
 
+    if (options.debug) log_transfer(query, length, res);
+
     if (res != CURLE_OK)
     {
         LOG_ERROR("curl_easy_perform() failed: %s", curl_easy_strerror(res));
+
+        // the address of the server may have changed: ask the bootstrap server again
+        if (options.bootstrap && !url_is_ip && time(NULL) - bootstrap_time >= BOOTSTRAP_RETRY)
+            bootstrap_apply();
+
         return EXIT_FAILURE;
     }
 
@@ -228,74 +489,53 @@ static int https_query(const unsigned char* query, size_t length)
     return EXIT_SUCCESS;
 }
 
-// offset of the first byte after the question section, 0 if malformed
-static size_t question_end(const unsigned char* p, size_t length)
+// open and bind the listening socket
+static int server_init()
 {
-    size_t i = sizeof(struct dns_header);
+    struct addrinfo hints, *ai = NULL;
+    char   port[8];
 
-    while (i < length && p[i])
+    memset(&hints, 0x00, sizeof(hints));
+    hints.ai_family     = AF_UNSPEC;
+    hints.ai_socktype   = SOCK_DGRAM;
+    hints.ai_flags      = AI_NUMERICHOST | AI_NUMERICSERV | AI_PASSIVE;
+    snprintf(port, sizeof(port), "%u", options.port);
+
+    if (getaddrinfo(options.listen_ip, port, &hints, &ai) != 0)
     {
-        if (p[i] & 0xC0) return 0;
-        i += p[i] + 1;
+        LOG_ERROR("invalid listen address (%s)", options.listen_ip);
+        return EXIT_FAILURE;
     }
 
-    i += 1 + 4;
+    sock = socket(ai->ai_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0)
+    {
+        LOG_ERROR("socket() %s", strerror(errno));
+        freeaddrinfo(ai);
+        return EXIT_FAILURE;
+    }
 
-    return i <= length ? i : 0;
+    if (bind(sock, ai->ai_addr, ai->ai_addrlen))
+    {
+        LOG_ERROR("bind(%s:%u) %s", options.listen_ip, options.port, strerror(errno));
+        freeaddrinfo(ai);
+        return EXIT_FAILURE;
+    }
+
+    freeaddrinfo(ai);
+
+    return EXIT_SUCCESS;
 }
 
 int server()
 {
-
-    struct sockaddr_in        server_add;
     buffer        = malloc(BUFFER_SIZE);
     resp.buf      = malloc(BUFFER_SIZE);
     resp.cap      = BUFFER_SIZE;
 
     if (buffer == NULL || resp.buf == NULL) return EXIT_FAILURE;
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
     if (curl_setup() == EXIT_FAILURE) return EXIT_FAILURE;
-
-    server_add.sin_family      = AF_INET;
-    server_add.sin_port        = htons(options.service_port);
-    server_add.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (options.service_ip[0] != '\0')
-    {
-        if (inet_pton(AF_INET, options.service_ip, &(server_add.sin_addr)) == 1)
-        {
-            LOG_INFO("service ip (%s)", options.service_ip);
-        }
-        else
-        {
-            LOG_ERROR("invalid service ip (%s)", options.service_ip);
-        }
-    }
-
-    LOG_DEBUG("service port (%d)", options.service_port);
-
-    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0)
-    {
-
-#if LOG_LEVEL == LEV_NO_DEV_LOG
-        perror("socket()");
-#endif
-        LOG_ERROR("socket() %s", strerror(errno));
-        return EXIT_FAILURE;
-    }
-
-    if (bind(sock, (struct sockaddr*) &server_add, sizeof(server_add)))
-    {
-
-#if LOG_LEVEL == LEV_NO_DEV_LOG
-        perror("bind()");
-#endif
-        LOG_ERROR("bind() %s", strerror(errno));
-        return EXIT_FAILURE;
-    }
-
 
     while (running)
     {
@@ -340,7 +580,7 @@ int server()
 
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
-    curl_global_cleanup();
+    curl_slist_free_all(resolve);
 
     free(buffer);
     free(resp.buf);
@@ -355,47 +595,99 @@ int main(int argc, char **argv)
     memset(&options, 0x00, sizeof(struct func_options));
 
     extern char* optarg;
-    extern int   optind;
     int          c;
 
+    options.listen_ip       = "127.0.0.1";
+    options.port            = DNS_SERVER_PORT;
+    options.server_timeout  = DNS_SERVER_TIMEOUT;
 
     static struct option long_options[] =
     {
+        {"url",        required_argument,       0, 'u'},
+        {"bootstrap",  required_argument,       0, 'b'},
+        {"listen",     required_argument,       0, 'l'},
+        {"port",       required_argument,       0, 'p'},
+        {"pid",        required_argument,       0, 'P'},
+        {"proxy",      required_argument,       0, 'x'},
+        {"pin",        required_argument,       0, 'k'},
         {"debug",      no_argument,             0, 'D'},
         {"help",       no_argument,             0, 'h'},
-        {"config",     required_argument,       0, 'f'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
 
-    while ((c = getopt_long(argc, argv, "hDf:", long_options, &option_index)) != -1)
+    while ((c = getopt_long(argc, argv, "u:b:l:p:P:x:k:Dh", long_options, &option_index)) != -1)
     {
         switch (c)
         {
-        case 'f':
-            strncpy(options.config_file, optarg, OPT_CONIG_FILE_LEN);
+        case 'u':
+            options.url = optarg;
+            break;
+        case 'b':
+            options.bootstrap = optarg;
+            break;
+        case 'l':
+            options.listen_ip = optarg;
+            break;
+        case 'p':
+        {
+            char* end = NULL;
+            long  val = strtol(optarg, &end, 10);
+
+            if (*optarg == '\0' || *end != '\0' || val < 1 || val > 65535)
+            {
+                fprintf(stderr, "invalid port (%s)\n", optarg);
+                return EXIT_FAILURE;
+            }
+            options.port = (uint16_t) val;
+            break;
+        }
+        case 'P':
+            options.pid_file = optarg;
+            break;
+        case 'x':
+            options.proxy = optarg;
+            break;
+        case 'k':
+            options.pin = optarg;
             break;
         case 'D':
-            options.enable_debug = 0xFF;
+            options.debug = 1;
             break;
         case 'h':
             usage(argv[0]);
-            return EXIT_FAILURE;
+            return EXIT_SUCCESS;
         default:
             usage(argv[0]);
             return EXIT_FAILURE;
         }
     }
 
-    if (options.config_file[0] != '\0' && parse_options() == EXIT_FAILURE)
+    if (options.url == NULL)
     {
-        LOG_ERROR("parsing the configuration file has been failed.");
+        fprintf(stderr, "--url is required\n");
+        usage(argv[0]);
+        return EXIT_FAILURE;
     }
 
-    if (options.server_url[0] == 0) strncpy(options.server_url, OPT_DEFAULT_URL, OPT_SERVER_URL_LEN - 1);
-    if (options.service_port == 0) options.service_port = DNS_SERVER_PORT;
-    if (options.server_timeout == 0) options.server_timeout = DNS_SERVER_TIMEOUT;
+    srand((unsigned) (time(NULL) ^ getpid()));
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    if (url_parse() == EXIT_FAILURE)
+    {
+        fprintf(stderr, "invalid url (%s), only http:// and https:// are supported\n", options.url);
+        return EXIT_FAILURE;
+    }
+
+    // bootstrap is needed only when the URL has a host name
+    if (options.bootstrap && !url_is_ip && bootstrap_apply() == EXIT_FAILURE)
+    {
+        fprintf(stderr, "bootstrap failed: cannot resolve %s through %s\n", url_host, options.bootstrap);
+        return EXIT_FAILURE;
+    }
+
+    if (server_init() == EXIT_FAILURE) return EXIT_FAILURE;
 
     peer_add_len  = sizeof(struct sockaddr_storage);
     running       = 1;
@@ -421,16 +713,20 @@ int main(int argc, char **argv)
     sigaction(SIGTERM,  &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    if (options.enable_debug != 0xFF)
+    if (!options.debug) start_daemon();
+
+    if (options.pid_file && create_pidfile() == EXIT_FAILURE)
     {
-        start_daemon();
-        if (create_pidfile() == EXIT_FAILURE) return EXIT_FAILURE;
+        LOG_ERROR("cannot create the pid file (%s)", options.pid_file);
+        return EXIT_FAILURE;
     }
 
     if (server() == EXIT_FAILURE)
         LOG_ERROR ("udp server failed to start.");
 
-    LOG_DEBUG ("Process Terminated.");
+    if (options.pid_file) unlink(options.pid_file);
+
+    curl_global_cleanup();
 
     return EXIT_SUCCESS;
 }
@@ -443,7 +739,6 @@ void handle_signal(int signal)
     case SIGTERM:
     case SIGUSR1:
     case SIGINT:
-        close(pidfp);
         running = 0;
     default:
         return;
@@ -453,107 +748,34 @@ void handle_signal(int signal)
 void usage(char* exec_name)
 {
     fprintf(stderr, "\n"LICENSE"\n\n");
-    fprintf(stderr, "Usage : %s [-D] [-f CONFIG_FILE]\n", exec_name);
-    fprintf(stderr, "        %s [-h|--help] Display this information.\n", exec_name);
+    fprintf(stderr, "Usage : %s --url URL [options]\n\n", exec_name);
+    fprintf(stderr,
+        "  -u, --url URL          DoH endpoint (RFC 8484), e.g. https://1.1.1.1/dns-query\n"
+        "  -b, --bootstrap IP,..  DNS server(s) used only to resolve the host name of the URL\n"
+        "  -l, --listen IP        address to listen on (default 127.0.0.1)\n"
+        "  -p, --port PORT        UDP port to listen on (default 53)\n"
+        "  -P, --pid FILE         write the PID file\n"
+        "  -x, --proxy URL        use a proxy for the DoH connection\n"
+        "  -k, --pin PIN          pin the server public key (sha256//base64)\n"
+        "  -D, --debug            stay in the foreground and log every query to stderr\n"
+        "  -h, --help             display this information\n");
 }
-
-int parse_options()
-{
-    FILE    *fp     = NULL;
-    char    *line   = NULL;
-    size_t  len     = 0;
-    ssize_t read    = 0;
-
-    options.https_proxy[0]      = 0;
-    options.server_url[0]       = 0;
-    options.server_ip_list[0]   = 0;
-    options.service_ip[0]       = 0;
-
-    fp = fopen(options.config_file, "r");
-    if (fp == NULL) return EXIT_FAILURE;
-
-    while ((read = getline(&line, &len, fp)) != -1)
-    {
-
-        // replace the trailing newline characters with the space character
-        for (size_t indx = 0; indx < read; indx++)
-        {
-            if (line[indx] == '\n' || line[indx] == '\r') line[indx] = 0x20;
-        }
-
-        int shift = remove_spaces(line);
-        read -= shift;
-
-        // skip too short lines
-        if (read < 3) continue;
-
-        // skip comment lines
-        if (line[0] == '#') continue;
-
-        if (strstr(line, OPT_HTTPS_PROXY) != NULL)
-        {
-            strncpy(options.https_proxy, line + sizeof(OPT_HTTPS_PROXY), OPT_HTTPS_PROXY_LEN);
-        }
-        else if (strstr(line, OPT_SERVER_URL) != NULL)
-        {
-            if (line[read - 1] == '/') line[read - 1] = '\0';
-            strncpy(options.server_url, line + sizeof(OPT_SERVER_URL), OPT_SERVER_URL_LEN - 1);
-        }
-        else if (strstr(line, OPT_SERVICE_PORT) != NULL)
-        {
-            options.service_port = atoi(line + sizeof(OPT_SERVICE_PORT));
-        }
-        else if (strstr(line, OPT_SERVICE_IP) != NULL)
-        {
-            strncpy(options.service_ip, line + sizeof(OPT_SERVICE_IP), OPT_SERVICE_IP_LEN);
-        }
-        else if (strstr(line, OPT_SERVICE_PUB_KEY) != NULL)
-        {
-            strncpy(options.service_pub_key, line + sizeof(OPT_SERVICE_PUB_KEY), OPT_CONIG_FILE_LEN);
-        }
-        else if (strstr(line, OPT_ENABLE_EDNS) != NULL)
-        {
-            if (strcasestr(line, OPT_ENABLE_TRUE) != NULL) options.enable_edns = 1;
-        }
-    }
-
-    free(line);
-
-    return EXIT_SUCCESS;
-}
-
 
 int create_pidfile()
 {
-    char str[10] = {0};
+    char str[16] = {0};
 
-    pidfp        = open(PIDFILE, O_RDWR|O_CREAT, 0600);
+    pidfp        = open(options.pid_file, O_RDWR|O_CREAT, 0644);
 
     if (pidfp == -1) return EXIT_FAILURE;
 
     if (lockf(pidfp, F_TLOCK,0) == -1) return EXIT_FAILURE;
 
-    sprintf(str,"%d\n", getpid());
+    if (ftruncate(pidfp, 0) == -1) return EXIT_FAILURE;
 
-    write(pidfp, str, strlen(str));
+    snprintf(str, sizeof(str), "%d\n", getpid());
+
+    if (write(pidfp, str, strlen(str)) < 0) return EXIT_FAILURE;
 
     return EXIT_SUCCESS;
-}
-
-int remove_spaces(char* str)
-{
-    if (str == NULL) return 0;
-
-    char* stra = str;
-    char* strb = str;
-    int shift = 0;
-
-    do
-    {
-        *stra = *strb;
-        if(*stra != ' ') stra++;
-        else shift++;
-    } while(*strb++ != 0);
-
-    return shift;
 }

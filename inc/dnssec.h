@@ -18,8 +18,6 @@
 #ifndef _DNSSSEC_H_
 #define _DNSSSEC_H_
 
-#define PIDFILE             "/var/run/dnsd.pid"
-
 #define LICENSE             "DNSd  Copyright (C) 2016  Kamary (https://github.com/kamarya).\n"\
                             "This program comes with ABSOLUTELY NO WARRANTY. \n"\
                             "You should have received a copy of the GNU General Public License\n"\
@@ -52,32 +50,13 @@
 #define MAX_DOMAIN_LENGTH       255
 #define MAX_SUBDOMAIN_LENGTH    63
 
-#define JSON_NO_ANSWER          -1
-#define JSON_NULL               -2
-
 #define TRUE                    1
 #define FALSE                   0
-
-#define OPT_CONIG_FILE_LEN      256
-#define OPT_HTTPS_PROXY         "https_proxy"
-#define OPT_HTTPS_PROXY_LEN     64
-#define OPT_SERVER_URL          "server_url"
-#define OPT_SERVER_URL_LEN      256
-#define OPT_SERVER_IP           "server_ip_list"
-#define OPT_SERVER_IP_LEN       512
-#define OPT_ENABLE_EDNS         "enable_edns_ecs"
-#define OPT_DEFAULT_URL         "https://1.1.1.1/dns-query"
-#define OPT_SERVICE_PORT        "service_port"
-#define OPT_SERVICE_IP          "service_ip"
-#define OPT_SERVICE_PUB_KEY     "service_pub_key"
-#define OPT_SERVICE_IP_LEN      INET6_ADDRSTRLEN
-#define OPT_ENABLE_TRUE         "true"
-#define OPT_ENABLE_FALSE        "false"
 
 #define MX_PREF_MAX_LEN         5
 #define DNS_ANSWER_LEN          12
 
-#define LOG_LEVEL               LEV_NO_DEV_LOG
+#define LOG_LEVEL               LEV_INFO
 #define DEBUG_ENABLE            0
 #define DEBUG_AUDIT_ENABLE      0
 #define BUFFER_SIZE             65535
@@ -85,21 +64,22 @@
 #define EDNS_MAX_SIZE           4096
 #define DNS_SERVER_PORT         53
 #define DNS_SERVER_TIMEOUT      10
+#define BOOTSTRAP_TIMEOUT       3
+#define BOOTSTRAP_RETRY         10
 
 #define UNUSED(x) (void)(x)
 
 struct func_options
 {
-    char      config_file[OPT_CONIG_FILE_LEN];
-    char      https_proxy[OPT_HTTPS_PROXY_LEN];
-    char      server_url[OPT_SERVER_URL_LEN];
-    char      server_ip_list[OPT_SERVER_IP_LEN];
-    char      service_ip[OPT_SERVICE_IP_LEN];
-    char      service_pub_key[OPT_CONIG_FILE_LEN];
-    uint16_t  server_timeout;
-    uint16_t  service_port;
-    uint8_t   enable_debug;
-    uint8_t   enable_edns;
+    const char*  url;
+    const char*  bootstrap;
+    const char*  listen_ip;
+    const char*  pid_file;
+    const char*  proxy;
+    const char*  pin;
+    uint16_t     server_timeout;
+    uint16_t     port;
+    uint8_t      debug;
 };
 
 struct dns_header
@@ -179,11 +159,7 @@ void    handle_signal(int);
 
 void    usage(char*);
 
-int     parse_options();
-
 int     create_pidfile();
-
-int     remove_spaces(char*);
 
 #endif /* DNSSL_H */
 
